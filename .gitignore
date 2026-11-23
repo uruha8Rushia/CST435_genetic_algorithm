@@ -1,2 +1,10 @@
 .vscode
 *.exe
+sequential
+parallel
+initial_fitness.txt
+final_fitness.txt
+results.csv
+results.md
+speedup.png
+efficiency.png
