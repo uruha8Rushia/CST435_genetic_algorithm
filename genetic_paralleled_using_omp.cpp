@@ -1,297 +1,348 @@
-#include <stdio.h>  //to use the printf function
-#include <conio.h>  //to use the getche function
-#include <stdlib.h> //to use the rand function
-#include <time.h>   //to use the time function
-#include <math.h>   //to use the pow function
-#include <omp.h>    //to use the openmp functionalities
+// =============================================================================
+// CST435 Assignment 1 - Genetic Algorithm, PARALLEL (OpenMP) version
+//
+// Based on "genetic_algorithm_implementation_in_c" by Mohamad Hosein Hoseinee,
+// Vahid Ramezani and Soroosh (2022):
+//   https://github.com/smhhoseinee/genetic_algorithm_implementation_in_c
+// Reused with the lecturer's permission and modified by our group (see README).
+//
+// This file and genetic_no_parallelism.cpp run the SAME algorithm with the
+// SAME random numbers. The only differences are the OpenMP pragmas and the
+// thread-count option, so the speedup measured between them comes from
+// parallelism alone. Given the same input and seed, both print identical results.
+//
+// Build:  g++ -O2 -fopenmp genetic_paralleled_using_omp.cpp -o parallel
+// Run:    parallel [-p population] [-i iterations] [-t threads] [-s seed] [-f file] [-q]
+// =============================================================================
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
+#include <chrono>
+#include <omp.h>
 
-#define GENE_COUNT 10
-#define POPULATION 1000
-#define ITER 500
-#define STATIC_POP_FILE "population.txt"
+#define GENE_COUNT 10                 // bits per chromosome
+#define FITNESS_MOD 101               // fitness = (binary value of the bits) mod 101
+#define MUTATION_FAC 5                // % chance per generation that one gene flips
 #define INITIAL_FITNESS_FILE "initial_fitness.txt"
 #define FINAL_FITNESS_FILE "final_fitness.txt"
-#define MUTATION_FAC 5
+
+// Random-number streams, so selection, crossover and mutation never share numbers
+enum { STREAM_SELECT = 1, STREAM_CROSS = 2, STREAM_MUTATE = 3 };
 
 typedef struct Chrom
-{ // creating the chrom structure
-    short int bit[GENE_COUNT];
-    int fit;
-    double prob;
+{
+    unsigned char bit[GENE_COUNT]; // bit[i] has weight 2^i
+    int fit;                       // fitness value, 0..100
+    double prob;                   // selection probability = fit / total fitness
 } chrom;
 
-void init_pop(chrom popcurrent[POPULATION]); // defining the functions that we will use
-int fitness(chrom chrom);
-void select(chrom popcurrent[POPULATION], chrom selected[POPULATION]);
-void crossover(chrom popnext[POPULATION]);
-void mutation(chrom popnext[POPULATION]);
-void sort(chrom popcurrent[POPULATION]);
-void print_pop(chrom pop[POPULATION], const char *stage, const char *output_file);
-
-int main()
+typedef struct Params
 {
-    omp_set_num_threads(16);
-    omp_set_dynamic(1);
-    chrom popcurrent[POPULATION];
-    chrom popnext[POPULATION];
-    clock_t elapsed_time;
+    int population;
+    int iterations;
+    int threads;
+    uint64_t seed;
+    const char *input_file;
+    int quiet; // 1 = don't write the fitness files (used by the benchmark script)
+} params;
 
-    init_pop(popcurrent);
-    printf("Initial Fitness Statistics:\n");
-    printf("---------------\n");
-    print_pop(popcurrent, "Before evolution", INITIAL_FITNESS_FILE);
+static uint64_t g_seed = 12345;
 
-    elapsed_time = clock();
-    for (int i = 0; i < ITER; i++)
-    {
-        select(popcurrent, popnext);
-        crossover(popnext);
-        mutation(popnext);
-#pragma omp parallel for
-        for (int j = 0; j < POPULATION; j++)
-        {
-            popcurrent[j] = popnext[j];
-        }
-    }
-    elapsed_time = clock() - elapsed_time;
-    printf("Final Fitness Statistics:\n");
-    printf("---------------\n");
-    print_pop(popcurrent, "After evolution", FINAL_FITNESS_FILE);
-
-    printf("Population %d and iteration %d \n\n", POPULATION, ITER);
-
-    printf("number of threads : %i\n",omp_get_max_threads());
-    printf("Elapsed time is: %f(s)\n",(((double)elapsed_time)/CLOCKS_PER_SEC));
-    // printf("omp_get_num_threads() : %i\n",omp_get_num_threads());
-    printf("is dynamic : %i\n",omp_get_dynamic());
-    
-    return 0;
+// -------------------------------------------------------------------- random --
+// Counter-based generator: the random number for (generation, index, stream) is
+// a hash of those values and the seed. Each chromosome gets its own number no
+// matter which thread handles it, so results do not depend on the thread count,
+// and threads never share random-number state.
+static inline uint64_t splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
 }
 
-void print_pop(chrom pop[POPULATION], const char *stage, const char *output_file)
-{ // prints population fitness statistics
-    long long int total_fitness = 0;
-    int max_fit = 0;
-    int min_fit = 101;
-#pragma omp parallel for reduction(+ : total_fitness) reduction(max : max_fit) reduction(min : min_fit)
-    for (int i = 0; i < POPULATION; i++)
+static inline uint64_t rand_u64(int gen, int index, int stream)
+{
+    uint64_t key = ((uint64_t)(uint32_t)gen << 32) ^ ((uint64_t)stream << 28) ^ (uint32_t)index;
+    return splitmix64(g_seed ^ splitmix64(key));
+}
+
+static inline double rand01(int gen, int index, int stream) // uniform in [0, 1)
+{
+    return (double)(rand_u64(gen, index, stream) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static inline int rand_int(int gen, int index, int stream, int n) // uniform in [0, n)
+{
+    return (int)(rand_u64(gen, index, stream) % (uint64_t)n);
+}
+
+// ------------------------------------------------------------------- fitness --
+int fitness(const chrom *c)
+{
+    int sum = 0;
+    for (int b = 0; b < GENE_COUNT; b++)
+    {
+        sum += c->bit[b] << b; // bit b is worth 2^b
+    }
+    return sum % FITNESS_MOD;
+}
+
+// Recompute every chromosome's selection probability. Returns total fitness.
+long long update_probabilities(chrom *pop, int n)
+{
+    long long total_fitness = 0;
+#pragma omp parallel for reduction(+ : total_fitness)
+    for (int i = 0; i < n; i++)
     {
         total_fitness += pop[i].fit;
-        max_fit = (pop[i].fit > max_fit) ? pop[i].fit : max_fit;
-        min_fit = (pop[i].fit < min_fit) ? pop[i].fit : min_fit;
     }
-    printf("Total Fitness is: %lld\n", total_fitness);
-    printf("Average Fitness is: %f\n", total_fitness / (double)POPULATION);
-    printf("Maximum Fitness is: %d\n", max_fit);
-    printf("Minimum Fitness is: %d\n", min_fit);
-    printf("\n");
-    for (int i = 0; i < 20; i++)
+#pragma omp parallel for
+    for (int i = 0; i < n; i++)
     {
-        printf("-");
+        pop[i].prob = (total_fitness == 0) ? 1.0 / n : (double)pop[i].fit / total_fitness;
     }
-    printf("\n\n");
+    return total_fitness;
+}
 
-    FILE *fitness_file = fopen(output_file, "wt");
-    if (fitness_file == NULL)
+// --------------------------------------------------------------------- input --
+// Reads the first n chromosomes from the input file: one string of 0s and 1s
+// per line; only the first GENE_COUNT characters are used.
+void init_pop(chrom *pop, int n, const char *file_name)
+{
+    FILE *file = fopen(file_name, "rt");
+    if (file == NULL)
+    {
+        printf("Error!\nCouldn't open population file '%s'.\n", file_name);
+        exit(EXIT_FAILURE);
+    }
+    char line[64];
+    for (int i = 0; i < n; i++)
+    {
+        if (fscanf(file, "%63s", line) != 1)
+        {
+            fclose(file);
+            printf("Error!\n'%s' contains fewer than %d chromosomes.\n", file_name, n);
+            exit(EXIT_FAILURE);
+        }
+        if ((int)strlen(line) < GENE_COUNT)
+        {
+            fclose(file);
+            printf("Error!\nLine %d is shorter than %d genes.\n", i + 1, GENE_COUNT);
+            exit(EXIT_FAILURE);
+        }
+        for (int b = 0; b < GENE_COUNT; b++)
+        {
+            if (line[b] != '0' && line[b] != '1')
+            {
+                fclose(file);
+                printf("Error!\nLine %d is not a string of 0s and 1s.\n", i + 1);
+                exit(EXIT_FAILURE);
+            }
+            pop[i].bit[b] = (unsigned char)(line[b] - '0');
+        }
+    }
+    fclose(file);
+
+#pragma omp parallel for
+    for (int i = 0; i < n; i++)
+    {
+        pop[i].fit = fitness(&pop[i]);
+    }
+    update_probabilities(pop, n);
+}
+
+// ---------------------------------------------------------- genetic operators --
+// Roulette-wheel selection: chromosome i is picked with probability prob[i].
+// Each of the n picks scans the cumulative probabilities, so this step is
+// O(n^2) and is where most of the running time goes. The n picks are
+// independent, so they are shared out between the threads.
+void select_pop(const chrom *current, chrom *selected, int n, int gen)
+{
+#pragma omp parallel for schedule(static)
+    for (int j = 0; j < n; j++)
+    {
+        double r = rand01(gen, j, STREAM_SELECT);
+        double cumulative = 0.0;
+        int pick = n - 1; // fallback in case rounding leaves r >= the total
+        for (int i = 0; i < n; i++)
+        {
+            cumulative += current[i].prob;
+            if (r < cumulative)
+            {
+                pick = i;
+                break;
+            }
+        }
+        selected[j] = current[pick];
+    }
+}
+
+// One-point crossover: child j takes the genes before a random cut point from
+// parent j and the genes after it from parent j+1 (wrapping around at the end).
+// Parents are read from 'selected' and children written to 'next', so every
+// child can be made independently.
+void crossover(const chrom *selected, chrom *next, int n, int gen)
+{
+#pragma omp parallel for
+    for (int j = 0; j < n; j++)
+    {
+        const chrom *a = &selected[j];
+        const chrom *b = &selected[(j + 1) % n];
+        int cut = 1 + rand_int(gen, j, STREAM_CROSS, GENE_COUNT - 1); // 1..GENE_COUNT-1
+        for (int g = 0; g < GENE_COUNT; g++)
+        {
+            next[j].bit[g] = (g < cut) ? a->bit[g] : b->bit[g];
+        }
+        next[j].fit = fitness(&next[j]);
+    }
+}
+
+// With MUTATION_FAC % chance, flip one random gene of one random chromosome.
+// Returns 1 if a mutation happened. O(1), so it stays sequential in both versions.
+int mutation(chrom *pop, int n, int gen)
+{
+    if (rand_int(gen, 0, STREAM_MUTATE, 100) >= MUTATION_FAC)
+    {
+        return 0;
+    }
+    int c = rand_int(gen, 1, STREAM_MUTATE, n);
+    int g = rand_int(gen, 2, STREAM_MUTATE, GENE_COUNT);
+    pop[c].bit[g] ^= 1;
+    pop[c].fit = fitness(&pop[c]);
+    return 1;
+}
+
+// -------------------------------------------------------------------- output --
+void print_pop(const chrom *pop, int n, const char *stage, const char *output_file, int quiet)
+{
+    long long total_fitness = 0;
+    int max_fit = 0;
+    int min_fit = FITNESS_MOD;
+#pragma omp parallel for reduction(+ : total_fitness) reduction(max : max_fit) reduction(min : min_fit)
+    for (int i = 0; i < n; i++)
+    {
+        total_fitness += pop[i].fit;
+        if (pop[i].fit > max_fit)
+            max_fit = pop[i].fit;
+        if (pop[i].fit < min_fit)
+            min_fit = pop[i].fit;
+    }
+    printf("%s\n", stage);
+    printf("--------------------\n");
+    printf("Total Fitness is:   %lld\n", total_fitness);
+    printf("Average Fitness is: %f\n", total_fitness / (double)n);
+    printf("Maximum Fitness is: %d\n", max_fit);
+    printf("Minimum Fitness is: %d\n\n", min_fit);
+
+    if (quiet)
+        return;
+    FILE *file = fopen(output_file, "wt");
+    if (file == NULL)
     {
         printf("Error!\nCouldn't open fitness output file '%s'.\n", output_file);
         exit(EXIT_FAILURE);
     }
-    fprintf(fitness_file, "%s\n", stage);
-    fprintf(fitness_file, "Total Fitness: %lld\n", total_fitness);
-    fprintf(fitness_file, "Average Fitness: %f\n", total_fitness / (double)POPULATION);
-    fprintf(fitness_file, "Maximum Fitness: %d\n", max_fit);
-    fprintf(fitness_file, "Minimum Fitness: %d\n", min_fit);
-    fprintf(fitness_file, "\n");
-    for (int i = 0; i < POPULATION; i++)
+    fprintf(file, "%s\n", stage);
+    fprintf(file, "Total Fitness: %lld\n", total_fitness);
+    fprintf(file, "Average Fitness: %f\n", total_fitness / (double)n);
+    fprintf(file, "Maximum Fitness: %d\n", max_fit);
+    fprintf(file, "Minimum Fitness: %d\n\n", min_fit);
+    for (int i = 0; i < n; i++)
     {
-        for (int j = 0; j < GENE_COUNT; j++)
-        {
-            fprintf(fitness_file, "%d", pop[i].bit[j]);
-        }
-        fprintf(fitness_file, " %d\n", pop[i].fit);
+        for (int b = 0; b < GENE_COUNT; b++)
+            fprintf(file, "%d", pop[i].bit[b]);
+        fprintf(file, " %d\n", pop[i].fit);
     }
-    fclose(fitness_file);
+    fclose(file);
 }
 
-chrom convert_str_2_chrom(char *chrom_str)
-{                 // Accepts a string of 1s & 0s to the length of GENE_COUNT.
-    chrom chromo; // Will return the corresponding chromosome.
-    for (int i = 0; i < GENE_COUNT; i++)
-    {
-        if (chrom_str[i] != '0' && chrom_str[i] != '1')
-        {
-            printf("Error!\nInvalid string as a chromosome.\n");
-            exit(EXIT_FAILURE);
-        }
-        chromo.bit[i] = chrom_str[i] - '0';
-    }
-    return chromo;
-}
-
-void init_pop(chrom popcurrent[POPULATION])
-{ // Read Initial population from a static file. STATIC_POP_FILE
-    FILE *population;
-
-    population = fopen(STATIC_POP_FILE, "rt");
-
-    if (population == NULL)
-    {
-        printf("Error!\nCouldn't open population file.\n");
-        exit(EXIT_FAILURE);
-    }
-    for (int i = 0; i < POPULATION; i++)
-    {
-        char chrom_str[GENE_COUNT + 2];
-        if (fscanf(population, "%s", chrom_str) != 1)
-        {
-            fclose(population);
-            printf("Error!\npopulation.txt contains fewer than %d chromosomes.\n", POPULATION);
-            exit(EXIT_FAILURE);
-        }
-        chrom_str[GENE_COUNT] = 0;
-        popcurrent[i] = convert_str_2_chrom(chrom_str);
-    }
-    fclose(population);
-    long long int total_fitness = 0;
-#pragma omp parallel for reduction(+ : total_fitness)
-    for (int i = 0; i < POPULATION; i++)
-    {
-        popcurrent[i].fit = fitness(popcurrent[i]);
-        total_fitness += popcurrent[i].fit;
-    }
-#pragma omp parallel for
-    for (int i = 0; i < POPULATION; i++)
-    {
-        popcurrent[i].prob = (total_fitness == 0)
-                                 ? 1.0 / POPULATION
-                                 : (double)popcurrent[i].fit / total_fitness;
-    }
-}
-
-int fitness(chrom chrom)
+// --------------------------------------------------------------- arguments --
+static void usage(const char *prog)
 {
-    int bit_number = 0;
-    int sum = 0;
-    while (bit_number < GENE_COUNT)
-    {
-        sum += chrom.bit[bit_number] * (1 << bit_number);
-        bit_number++;
-    }
-    sum = sum % 101;
-    return (sum); // return the value of sum
+    printf("Usage: %s [-p population] [-i iterations] [-t threads] [-s seed] [-f population_file] [-q]\n", prog);
+    exit(EXIT_FAILURE);
 }
 
-void select(chrom popcurrent[POPULATION], chrom selected[POPULATION])
-{ // perfom selection on the curr pop considering prob.
-#pragma omp parallel for
-    for (int j = 0; j < POPULATION; j++)
-    {
-        uint32_t seed = (uint32_t)(j + 1) * 1664525u + 1013904223u;
-        seed ^= (uint32_t)omp_get_thread_num() * 0x9e3779b9u;
-        seed = seed * 1664525u + 1013904223u;
-        double random = (double)(seed >> 8) / (double)(1u << 24);
-        double cumulative_prob = 0;
-        for (int i = 0; i < POPULATION; i++)
-        {
-            cumulative_prob += popcurrent[i].prob;
-            if (random < cumulative_prob)
-            {
-                selected[j] = popcurrent[i];
-                break;
-            }
-        }
-    }
-}
-
-void sort(chrom popcurrent[POPULATION])
-{ // sort pop by their prob
-    chrom temp;
-    for (int i = 0; i < POPULATION; i++)
-    {
-        for (int j = 0; j < POPULATION - 1; j++)
-        {
-            if (popcurrent[j].fit > popcurrent[j + 1].fit)
-            {
-                temp = popcurrent[j + 1];
-                popcurrent[j + 1] = popcurrent[j];
-                popcurrent[j] = temp;
-            }
-        }
-    }
-}
-
-void crossover(chrom popnext[POPULATION])
-{ // crossover function takes a pointer to array of chromes
-    uint32_t random_state = (uint32_t)time(NULL) ^ 0xA5A5A5A5u;
-    random_state = random_state * 1664525u + 1013904223u;
-    int random = (int)((random_state >> 8) % (GENE_COUNT - 1)) + 1;
-    chrom temp_child;
-    for (int i = 0; i < random; i++)
-    {
-        temp_child.bit[i] = popnext[0].bit[i];
-    }
-    for (int i = random; i < GENE_COUNT; i++)
-    {
-        temp_child.bit[i] = popnext[POPULATION - 1].bit[i];
-    }
-    for (int chrom_counter = 0; chrom_counter < POPULATION; chrom_counter++)
-    {
-        random_state = random_state * 1664525u + 1013904223u;
-        random = (int)((random_state >> 8) % (GENE_COUNT - 1)) + 1;
-        for (int i = random; i < GENE_COUNT; i++)
-        {
-            if (chrom_counter + 1 < POPULATION)
-            {
-                popnext[chrom_counter].bit[i] = popnext[chrom_counter + 1].bit[i];
-            }
-        }
-    }
-    popnext[POPULATION - 1] = temp_child; // the last popnext chrom now becomes the new child
-
-    long long int total_fitness = 0;
-#pragma omp parallel for reduction(+ : total_fitness)
-    for (int i = 0; i < POPULATION; i++)
-    {
-        popnext[i].fit = fitness(popnext[i]);
-        total_fitness += popnext[i].fit;
-    }
-#pragma omp parallel for
-    for (int i = 0; i < POPULATION; i++)
-    {
-        popnext[i].prob = (total_fitness == 0)
-                              ? 1.0 / POPULATION
-                              : (double)popnext[i].fit / total_fitness;
-    }
-}
-
-void mutation(chrom popnext[POPULATION])
+params parse_args(int argc, char **argv)
 {
-    uint32_t state = (uint32_t)time(NULL) ^ 0xC001D00Du;
-    state = state * 1664525u + 1013904223u;
-    int prob = (int)((state >> 8) % 101);
-    if (prob <= MUTATION_FAC)
+    params p = {1000, 500, omp_get_num_procs(), 12345, "population.txt", 0};
+    for (int a = 1; a < argc; a++)
     {
-        state = state * 1664525u + 1013904223u;
-        int chrom_index = (int)((state >> 8) % POPULATION);
-        state = state * 1664525u + 1013904223u;
-        int gene = (int)((state >> 8) % GENE_COUNT);
-        popnext[chrom_index].bit[gene] = (popnext[chrom_index].bit[gene] == 1) ? 0 : 1;
-        popnext[chrom_index].fit = fitness(popnext[chrom_index]);
-
-        long long int total_fitness = 0;
-#pragma omp parallel for reduction(+ : total_fitness)
-        for (int i = 0; i < POPULATION; i++)
+        if (strcmp(argv[a], "-q") == 0)
         {
-            total_fitness += popnext[i].fit;
+            p.quiet = 1;
+            continue;
         }
-#pragma omp parallel for
-        for (int i = 0; i < POPULATION; i++)
-        {
-            popnext[i].prob = (total_fitness == 0)
-                                  ? 1.0 / POPULATION
-                                  : (double)popnext[i].fit / total_fitness;
-        }
+        if (a + 1 >= argc)
+            usage(argv[0]);
+        if (strcmp(argv[a], "-p") == 0)
+            p.population = atoi(argv[++a]);
+        else if (strcmp(argv[a], "-i") == 0)
+            p.iterations = atoi(argv[++a]);
+        else if (strcmp(argv[a], "-t") == 0)
+            p.threads = atoi(argv[++a]);
+        else if (strcmp(argv[a], "-s") == 0)
+            p.seed = strtoull(argv[++a], NULL, 10);
+        else if (strcmp(argv[a], "-f") == 0)
+            p.input_file = argv[++a];
+        else
+            usage(argv[0]);
     }
+    if (p.population < 2 || p.iterations < 1 || p.threads < 1)
+        usage(argv[0]);
+    return p;
+}
+
+// ---------------------------------------------------------------------- main --
+int main(int argc, char **argv)
+{
+    params p = parse_args(argc, argv);
+    g_seed = p.seed;
+    omp_set_dynamic(0); // use exactly the requested number of threads
+    omp_set_num_threads(p.threads);
+
+    // Heap allocation, so large populations don't overflow the stack
+    chrom *pop = (chrom *)malloc(sizeof(chrom) * p.population);
+    chrom *selected = (chrom *)malloc(sizeof(chrom) * p.population);
+    if (pop == NULL || selected == NULL)
+    {
+        printf("Error!\nNot enough memory for %d chromosomes.\n", p.population);
+        return EXIT_FAILURE;
+    }
+
+    init_pop(pop, p.population, p.input_file);
+    print_pop(pop, p.population, "Before evolution", INITIAL_FITNESS_FILE, p.quiet);
+
+    // Only the evolution loop is timed (file input/output is excluded)
+    auto start = std::chrono::steady_clock::now();
+    for (int gen = 0; gen < p.iterations; gen++)
+    {
+        select_pop(pop, selected, p.population, gen);
+        crossover(selected, pop, p.population, gen);
+        update_probabilities(pop, p.population);
+        if (mutation(pop, p.population, gen))
+            update_probabilities(pop, p.population);
+    }
+    auto end = std::chrono::steady_clock::now();
+    double seconds = std::chrono::duration<double>(end - start).count();
+
+    print_pop(pop, p.population, "After evolution", FINAL_FITNESS_FILE, p.quiet);
+
+    long long total = 0;
+    for (int i = 0; i < p.population; i++)
+        total += pop[i].fit;
+    printf("Version: parallel (OpenMP)\n");
+    printf("Population %d, iterations %d, seed %llu\n", p.population, p.iterations,
+           (unsigned long long)p.seed);
+    printf("Number of threads: %d\n", p.threads);
+    printf("Elapsed time is: %f(s)\n", seconds);
+    // Machine-readable line for bench.py
+    printf("RESULT,parallel,%d,%d,%d,%.6f,%lld\n", p.population, p.iterations, p.threads, seconds,
+           total);
+
+    free(pop);
+    free(selected);
+    return 0;
 }
