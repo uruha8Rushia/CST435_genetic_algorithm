@@ -91,14 +91,18 @@ void print_pop(chrom pop[POPULATION], const char *stage, const char *output_file
         exit(EXIT_FAILURE);
     }
     fprintf(fitness_file, "%s\n", stage);
+    fprintf(fitness_file, "Total Fitness: %lld\n", total_fitness);
+    fprintf(fitness_file, "Average Fitness: %f\n", total_fitness / (double)POPULATION);
+    fprintf(fitness_file, "Maximum Fitness: %d\n", max_fit);
+    fprintf(fitness_file, "Minimum Fitness: %d\n", min_fit);
+    fprintf(fitness_file, "\n");
     for (int i = 0; i < POPULATION; i++)
     {
-        fprintf(fitness_file, "%d ", pop[i].fit);
         for (int j = 0; j < GENE_COUNT; j++)
         {
             fprintf(fitness_file, "%d", pop[i].bit[j]);
         }
-        fprintf(fitness_file, "\n");
+        fprintf(fitness_file, " %d\n", pop[i].fit);
     }
     fclose(fitness_file);
 }
